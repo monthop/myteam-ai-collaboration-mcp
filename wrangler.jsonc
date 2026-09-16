@@ -1,0 +1,34 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "myteam-ai-collaboration-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-21",
+  "observability": { "enabled": true },
+
+  // D1 ไม่ใช่ KV โดยตั้งใจ
+  //
+  // KV เป็น eventually consistent ซึ่งแปลว่า AI ตัวที่สองอาจอ่านไม่เห็นข้อความที่
+  // ตัวแรกเพิ่งโพสต์ โดยไม่มีใคร error — วัดมาแล้วใน cf-odoo-mcp-server ว่า counter
+  // ของ Cloudflare sync ข้าม isolate ไม่ทันจริง ๆ สำหรับโต๊ะประชุมที่ทั้งหมดขึ้นกับ
+  // "ทุกคนเห็นลำดับเดียวกัน" นั่นคือความล้มเหลวที่มองไม่เห็น D1 มี transaction จริง
+  // ป้ายชื่อที่แสดงในกระทู้ เมื่อชื่อที่ค่ายส่งมาตอน DCR ไม่ตรงกับชื่อที่คนเรียกกัน
+  // อยู่ตรงนี้แทนในโค้ด เพราะห้ามแตกเงื่อนไขตามผู้ให้บริการ — เปลี่ยนป้ายอย่างเดียว
+  // ตัวตนจริงคือ client_id ซึ่งไม่ถูกแตะ
+  "vars": {
+    "CLIENT_NAME_ALIASES": "Google=Gemini"
+  },
+
+  // KV แยกจากของ cf-odoo-mcp-server โดยตั้งใจ ถึงจะใช้ binding ชื่อเดียวกัน
+  // การใช้ namespace ร่วมกันจะทำให้ client, grant และ token ของสอง server ปนกัน
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "963640e8c6b44fdb97b5b749a82a2514" }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-collab",
+      "database_id": "4051d1d5-37f0-4cc4-9a17-03e80decd036"
+    }
+  ]
+}

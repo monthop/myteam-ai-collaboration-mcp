@@ -1,0 +1,826 @@
+import { env } from "cloudflare:test";
+import { beforeEach, describe, expect, it } from "vitest";
+import { resetDatabase } from "./apply-schema";
+import { RequestError, createDiscussion, readMessages } from "../src/db";
+import {
+  acceptHandoff,
+  createHandoff,
+  createTask,
+  getCurrentHandoffId,
+  getTask,
+  readDecisions,
+  readHandoffs,
+  readOpenItems,
+  readTasks,
+  readPlans,
+  recordDecision,
+  recordPlan,
+  resolveDecision,
+  updateTask,
+} from "../src/db-work";
+
+const chatgpt = { client: "c-chatgpt", name: "ChatGPT" };
+const claude = { client: "c-claude", name: "Claude" };
+const gemini = { client: "c-gemini", name: "Gemini" };
+
+beforeEach(async () => {
+  await resetDatabase();
+});
+
+const WS = "ws-001";
+
+describe("decision", () => {
+  /**
+   * ข้อนี้สำคัญที่สุดของ Phase 2 — ถ้ามีใครเพิ่มทางให้ตั้ง status เองเมื่อไหร่
+   * ตารางนี้จะไม่ต่างจากข้อความธรรมดา และหลักการ "เสนอไม่เท่ากับตัดสิน" ก็หายไป
+   */
+  it("สร้างได้เฉพาะสถานะ proposed", async () => {
+    const d = await recordDecision(env.DB, WS, "ใช้ D1", "เพราะต้องการ transaction", chatgpt);
+
+    expect(d.status).toBe("proposed");
+    expect(d.decided_by).toBeNull();
+    expect(d.decided_at).toBeNull();
+  });
+
+  it("เก็บทั้งชื่อและ client ของผู้เสนอ", async () => {
+    await recordDecision(env.DB, WS, "ใช้ D1", "เหตุผล", gemini);
+    const page = await readDecisions(env.DB, WS, 10);
+
+    expect(page.rows[0]!.proposed_by).toBe("Gemini");
+    expect(page.rows[0]!.proposed_by_client).toBe("c-gemini");
+  });
+
+  it("ผูกกับกระทู้ที่เป็นที่มาได้", async () => {
+    const dis = await createDiscussion(env.DB, WS, "ควรใช้อะไร", chatgpt);
+    const d = await recordDecision(env.DB, WS, "ใช้ D1", "เหตุผล", chatgpt, dis.id);
+
+    expect(d.discussion_id).toBe(dis.id);
+  });
+
+  it("ผูกกับกระทู้ที่ไม่มีอยู่ไม่ได้", async () => {
+    await expect(
+      recordDecision(env.DB, WS, "x", "y", chatgpt, "ไม่มีจริง"),
+    ).rejects.toThrow(RequestError);
+  });
+
+  it("กรองตามสถานะได้ และบอก has_more เมื่อถูกตัด", async () => {
+    for (let i = 0; i < 4; i++) {
+      await recordDecision(env.DB, WS, `ข้อสรุป ${i}`, "เหตุผล", chatgpt);
+    }
+
+    const all = await readDecisions(env.DB, WS, 2);
+    expect(all.rows).toHaveLength(2);
+    expect(all.has_more).toBe(true);
+    expect(all.total).toBe(4);
+
+    const approved = await readDecisions(env.DB, WS, 10, "approved");
+    expect(approved.rows).toEqual([]);
+    expect(approved.total).toBe(0);
+  });
+});
+
+describe("task", () => {
+  it("เริ่มที่ open และจำผู้สร้าง", async () => {
+    const t = await createTask(env.DB, WS, "ย้ายไป D1", "รายละเอียด", chatgpt);
+
+    expect(t.status).toBe("open");
+    expect(t.created_by).toBe("ChatGPT");
+    expect(t.assigned_to).toBeNull();
+    expect(t.updated_by).toBeNull();
+  });
+
+  it("แก้สถานะแล้วบันทึกว่าใครแก้", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const after = await updateTask(env.DB, t.id, claude, { status: "done" });
+
+    expect(after.status).toBe("done");
+    expect(after.updated_by).toBe("Claude");
+    expect(after.updated_at).not.toBeNull();
+  });
+
+  /**
+   * เรียกโดยไม่เปลี่ยนอะไรแล้วได้ success กลับไป จะทำให้ผู้เรียกเชื่อว่าแก้แล้ว
+   * ทั้งที่ไม่ได้แก้ — เป็นรูปแบบเดียวกับบั๊กที่ไล่แก้มาทั้งโปรเจกต์ก่อนหน้า
+   */
+  it("ไม่ระบุอะไรให้แก้เลย ต้อง error ไม่ใช่เงียบ ๆ ผ่าน", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    await expect(updateTask(env.DB, t.id, claude, {})).rejects.toThrow(RequestError);
+  });
+
+  it("แก้งานที่ไม่มีอยู่ ต้อง error", async () => {
+    await expect(
+      updateTask(env.DB, "ไม่มีจริง", claude, { status: "done" }),
+    ).rejects.toThrow(RequestError);
+  });
+
+  it("กรองตามสถานะและผู้รับผิดชอบได้", async () => {
+    const a = await createTask(env.DB, WS, "งาน A", "", chatgpt);
+    await createTask(env.DB, WS, "งาน B", "", chatgpt);
+    await updateTask(env.DB, a.id, claude, { status: "done", assigned_to: "Claude" });
+
+    const done = await readTasks(env.DB, WS, 10, { status: "done" });
+    expect(done.rows.map((t) => t.title)).toEqual(["งาน A"]);
+
+    const mine = await readTasks(env.DB, WS, 10, { assigned_to: "Claude" });
+    expect(mine.rows).toHaveLength(1);
+
+    const open = await readTasks(env.DB, WS, 10, { status: "open" });
+    expect(open.rows.map((t) => t.title)).toEqual(["งาน B"]);
+  });
+});
+
+describe("handoff", () => {
+  it("ส่งต่อแล้วงานเปลี่ยนผู้รับผิดชอบไปด้วย", async () => {
+    const t = await createTask(env.DB, WS, "ย้าย schema", "", chatgpt);
+    const { handoff, task } = await createHandoff(
+      env.DB,
+      t.id,
+      "Claude",
+      "ทำ schema เสร็จแล้ว เหลือ migration",
+      chatgpt,
+    );
+
+    expect(handoff.status).toBe("pending");
+    expect(handoff.from_name).toBe("ChatGPT");
+    // ถ้าสองที่ไม่ตรงกัน คนอ่านตาราง task จะไม่รู้ว่างานย้ายไปแล้ว
+    expect(task.assigned_to).toBe("Claude");
+  });
+
+  it("รับงานแล้วเปลี่ยนเป็น in_progress และผู้รับคือคนที่เรียก", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "ใครก็ได้", "ช่วยที", chatgpt);
+
+    const result = await acceptHandoff(env.DB, handoff.id, gemini);
+
+    expect(result.handoff.accepted_by).toBe("Gemini");
+    expect(result.handoff.accepted_client).toBe("c-gemini");
+    expect(result.task.status).toBe("in_progress");
+    // ชื่อจริงของผู้รับ ไม่ใช่ค่าที่ผู้ส่งพิมพ์ไว้
+    expect(result.task.assigned_to).toBe("Gemini");
+  });
+
+  it("รับซ้ำไม่ได้ และบอกว่าใครรับไปแล้ว", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "Claude", "ช่วยที", chatgpt);
+    await acceptHandoff(env.DB, handoff.id, claude);
+
+    await expect(acceptHandoff(env.DB, handoff.id, gemini)).rejects.toThrow(/Claude/);
+  });
+
+  it("ส่งต่องานที่ไม่มีอยู่ไม่ได้", async () => {
+    await expect(
+      createHandoff(env.DB, "ไม่มีจริง", "Claude", "ช่วยที", chatgpt),
+    ).rejects.toThrow(RequestError);
+  });
+
+  it("กรองเฉพาะที่ยังไม่มีใครรับได้", async () => {
+    const a = await createTask(env.DB, WS, "งาน A", "", chatgpt);
+    const b = await createTask(env.DB, WS, "งาน B", "", chatgpt);
+    const first = await createHandoff(env.DB, a.id, "Claude", "ช่วยที", chatgpt);
+    await createHandoff(env.DB, b.id, "Gemini", "ช่วยด้วย", chatgpt);
+    await acceptHandoff(env.DB, first.handoff.id, claude);
+
+    const pending = await readHandoffs(env.DB, WS, 10, { status: "pending" });
+    expect(pending.rows).toHaveLength(1);
+    expect(pending.rows[0]!.to_whom).toBe("Gemini");
+
+    const forClaude = await readHandoffs(env.DB, WS, 10, { to_whom: "Claude" });
+    expect(forClaude.rows).toHaveLength(1);
+  });
+
+  /**
+   * เดิม `readHandoffs` ไม่รับ workspace เลย จึงคืนของทุก workspace ปนกัน ขณะที่
+   * `get_tasks` กับ `get_workspace_context` scope ตาม workspace ทั้งคู่ — ของทดสอบ
+   * ใน ws-test จึงไปโผล่ในรายการงานจริงของ ws-001 โดยไม่มีใคร error
+   */
+  it("เห็นเฉพาะ handoff ของ workspace ที่ถาม", async () => {
+    await env.DB.prepare(
+      "INSERT INTO workspaces (id, name, created_at) VALUES ('ws-002','อีกอัน','2026-01-01T00:00:00.000Z')",
+    ).run();
+    const here = await createTask(env.DB, WS, "งานที่นี่", "", chatgpt);
+    const there = await createTask(env.DB, "ws-002", "งานที่อื่น", "", chatgpt);
+    await createHandoff(env.DB, here.id, "Claude", "ช่วยที", chatgpt);
+    await createHandoff(env.DB, there.id, "Claude", "ช่วยที", chatgpt);
+
+    const mine = await readHandoffs(env.DB, WS, 10, {});
+    expect(mine.rows.map((h) => h.task_id)).toEqual([here.id]);
+    expect(mine.total).toBe(1);
+  });
+
+  it("workspace ที่ไม่มีอยู่ต้อง error ไม่ใช่คืนลิสต์ว่าง", async () => {
+    await expect(readHandoffs(env.DB, "ws-ไม่มีจริง", 10, {})).rejects.toThrow(RequestError);
+  });
+
+  it("เส้นทางเต็ม: กระทู้ → decision → task → handoff → รับงาน", async () => {
+    const dis = await createDiscussion(env.DB, WS, "ควรใช้ D1 หรือ KV", chatgpt);
+    const dec = await recordDecision(env.DB, WS, "ใช้ D1", "ต้องการ transaction", chatgpt, dis.id);
+    const task = await createTask(env.DB, WS, "ย้ายไป D1", "ตามข้อสรุป", chatgpt, dis.id);
+    const { handoff } = await createHandoff(env.DB, task.id, "Gemini", "เหลือ migration", chatgpt);
+    await acceptHandoff(env.DB, handoff.id, gemini);
+
+    const final = await getTask(env.DB, task.id);
+    expect(dec.discussion_id).toBe(dis.id);
+    expect(final.discussion_id).toBe(dis.id);
+    expect(final.status).toBe("in_progress");
+    expect(final.assigned_to).toBe("Gemini");
+  });
+});
+
+describe("สภาพของ handoff ที่ยังไม่ถูกรับ", () => {
+  /** ย้อนวันที่สร้างของ handoff เพื่อทดสอบเส้นแบ่ง stale โดยไม่ต้องรอจริงเจ็ดวัน */
+  async function backdate(handoffId: string, days: number): Promise<void> {
+    const when = new Date(Date.now() - days * 86_400_000).toISOString();
+    await env.DB.prepare("UPDATE handoffs SET created_at = ?1 WHERE id = ?2")
+      .bind(when, handoffId)
+      .run();
+  }
+
+  it("ใบที่เพิ่งส่งยังรอคนรับอยู่", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    await createHandoff(env.DB, t.id, "Claude", "ช่วยที", chatgpt);
+
+    const page = await readHandoffs(env.DB, WS, 10, {});
+    expect(page.rows[0]!.state).toBe("waiting");
+  });
+
+  it("ค้างเกินเจ็ดวันแล้วขึ้นเป็น stale", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "Gemini", "ช่วยที", chatgpt);
+    await backdate(handoff.id, 8);
+
+    const page = await readHandoffs(env.DB, WS, 10, {});
+    expect(page.rows[0]!.state).toBe("stale");
+
+    // stale ยังต้องรับได้อยู่ — มันคือของที่รอนานเกินไป ไม่ใช่ของที่ไม่ต้องทำ
+    const items = await readOpenItems(env.DB, WS, "Gemini");
+    expect(items.handoffs_pending).toBe(1);
+    expect(items.waiting_for_you.unaccepted.handoffs[0]!.state).toBe("stale");
+  });
+
+  /**
+   * เคสที่ทำให้ใบเก่านอน pending ตลอดกาล — งานถูกส่งต่ออีกทอดไปหาคนใหม่ ใบแรกไม่มี
+   * ใครต้องรับแล้วแต่ก็ไม่มีอะไรมาปิดมัน
+   */
+  it("ใบเก่ากลายเป็น superseded เมื่อมีใบใหม่กว่าของงานเดียวกัน", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff: first } = await createHandoff(env.DB, t.id, "Claude", "ช่วยที", chatgpt);
+    await backdate(first.id, 1);
+    const { handoff: second } = await createHandoff(env.DB, t.id, "Gemini", "ส่งต่อ", claude);
+
+    const page = await readHandoffs(env.DB, WS, 10, {});
+    const byId = new Map(page.rows.map((h) => [h.id, h.state]));
+    expect(byId.get(first.id)).toBe("superseded");
+    expect(byId.get(second.id)).toBe("waiting");
+
+    // ปลายทางเดิมไม่ต้องมารับของที่ถูกแทนไปแล้ว
+    const claudeItems = await readOpenItems(env.DB, WS, "Claude");
+    expect(claudeItems.waiting_for_you.unaccepted.handoffs).toEqual([]);
+    // ยอดของ workspace: ใบใหม่ยังรอ Gemini อยู่ ส่วนใบเก่านับแยกไว้ไม่ให้หายเงียบ
+    expect(claudeItems.handoffs_pending).toBe(1);
+    expect(claudeItems.handoffs_inactive).toBe(1);
+  });
+
+  it("ใบที่ชี้ไปงานที่ done แล้วเป็น obsolete และไม่รอใครอีก", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    await createHandoff(env.DB, t.id, "Gemini", "ช่วยที", chatgpt);
+    await updateTask(env.DB, t.id, chatgpt, { status: "done" });
+
+    const page = await readHandoffs(env.DB, WS, 10, {});
+    expect(page.rows[0]!.state).toBe("obsolete");
+
+    const items = await readOpenItems(env.DB, WS, "Gemini");
+    expect(items.handoffs_pending).toBe(0);
+    expect(items.handoffs_inactive).toBe(1);
+    expect(items.waiting_for_you.total).toBe(0);
+  });
+
+  /**
+   * ก่อนหน้านี้รับได้ ซึ่งจะดึงงานที่จบไปแล้วกลับเป็น in_progress — ตารางเล่าเรื่อง
+   * ที่ไม่ได้เกิดขึ้น
+   */
+  it("รับใบที่ชี้ไปงานที่ done แล้วไม่ได้", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "Gemini", "ช่วยที", chatgpt);
+    await updateTask(env.DB, t.id, chatgpt, { status: "done" });
+
+    await expect(acceptHandoff(env.DB, handoff.id, gemini)).rejects.toThrow(RequestError);
+    expect((await getTask(env.DB, t.id)).status).toBe("done");
+  });
+
+  it("รับใบที่ถูกแทนด้วยใบใหม่กว่าไม่ได้", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff: first } = await createHandoff(env.DB, t.id, "Claude", "ช่วยที", chatgpt);
+    await env.DB.prepare("UPDATE handoffs SET created_at = ?1 WHERE id = ?2")
+      .bind(new Date(Date.now() - 86_400_000).toISOString(), first.id)
+      .run();
+    const { handoff: second } = await createHandoff(env.DB, t.id, "Gemini", "ส่งต่อ", claude);
+
+    await expect(acceptHandoff(env.DB, first.id, claude)).rejects.toThrow(/ใหม่กว่า/);
+    // ใบล่าสุดยังรับได้ตามปกติ
+    const result = await acceptHandoff(env.DB, second.id, gemini);
+    expect(result.task.status).toBe("in_progress");
+  });
+
+  it("ใบที่ถูกรับไปแล้วขึ้นเป็น accepted ไม่ใช่ superseded", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "Claude", "ช่วยที", chatgpt);
+    await acceptHandoff(env.DB, handoff.id, claude);
+
+    const page = await readHandoffs(env.DB, WS, 10, { status: "accepted" });
+    expect(page.rows[0]!.state).toBe("accepted");
+  });
+
+  /**
+   * สองใบที่สร้างในคำขอเดียวกันได้ timestamp เท่ากัน เพราะเวลาใน Workers ไม่ขยับ
+   * ระหว่างโค้ดที่รันติดกัน ถ้าเทียบแค่เวลาจะกลายเป็นว่าทั้งคู่แทนที่กันเองแล้วไม่มี
+   * ใบไหนเหลือให้รับเลย
+   */
+  it("สองใบที่เวลาเท่ากันยังเหลือใบล่าสุดให้รับ", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff: first } = await createHandoff(env.DB, t.id, "Claude", "ช่วยที", chatgpt);
+    const { handoff: second } = await createHandoff(env.DB, t.id, "Gemini", "ส่งต่อ", claude);
+
+    if (first.created_at !== second.created_at) return; // เวลาเดินจริง เคสนี้ไม่เกิด
+
+    const page = await readHandoffs(env.DB, WS, 10, {});
+    const states = page.rows.map((h) => h.state);
+    expect(states.filter((x) => x === "waiting")).toHaveLength(1);
+  });
+});
+
+describe("บอกได้ว่าไม่มีเจ้าของ และบอกได้ว่ายังไม่มีใครถูกส่งงาน", () => {
+  /**
+   * เดิม create_task เขียน null ได้แต่ update_task รับเฉพาะ string ทีมที่จะถอดเจ้าของ
+   * จึงต้องส่งค่าว่างมาแทน ฟิลด์เดียวกันจึงมีสองค่าที่แปลว่าไม่มีเหมือนกัน
+   */
+  it("ถอดเจ้าของด้วย null ได้", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt, undefined, "Gemini");
+
+    const after = await updateTask(env.DB, t.id, claude, { assigned_to: null });
+    expect(after.assigned_to).toBeNull();
+  });
+
+  it("ค่าว่างกับช่องว่างล้วนถูกเก็บเป็น null ไม่ใช่สตริงว่าง", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt, undefined, "Gemini");
+    const blanked = await updateTask(env.DB, t.id, claude, { assigned_to: "   " });
+    expect(blanked.assigned_to).toBeNull();
+
+    const created = await createTask(env.DB, WS, "อีกใบ", "", chatgpt, undefined, "  ");
+    expect(created.assigned_to).toBeNull();
+  });
+
+  it("ชื่อที่มีช่องว่างหัวท้ายถูกตัดให้ตรงกับที่ผู้ส่งงานพิมพ์", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt, undefined, " Gemini ");
+    expect(t.assigned_to).toBe("Gemini");
+  });
+
+  /**
+   * เหตุผลของฟิลด์นี้ — ผู้เรียกที่จะเล่าว่าส่งงานให้ทีมใดแล้ว ต้องมองผ่านค่า null
+   * ให้ได้ก่อน ซึ่งยากกว่าการลืมเรียก tool ที่สอง
+   */
+  it("task ที่มีเจ้าของแต่ไม่มีใครถูกส่งงาน คืน handoff เป็น null", async () => {
+    await createTask(env.DB, WS, "งานที่มีแต่เจ้าของ", "", chatgpt, undefined, "Gemini");
+
+    const page = await readTasks(env.DB, WS, 10, {});
+    expect(page.rows[0]!.handoff).toBeNull();
+  });
+
+  it("พอส่งงานจริงแล้ว handoff ชี้ไปที่ใบที่รออยู่", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "Gemini", "ช่วยต่อ", chatgpt);
+
+    const page = await readTasks(env.DB, WS, 10, {});
+    expect(page.rows[0]!.handoff).toBe(handoff.id);
+    expect(await getCurrentHandoffId(env.DB, t.id)).toBe(handoff.id);
+  });
+
+  it("รับงานไปแล้วไม่มีใบไหนรออยู่อีก", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "Gemini", "ช่วยต่อ", chatgpt);
+    await acceptHandoff(env.DB, handoff.id, gemini);
+
+    expect(await getCurrentHandoffId(env.DB, t.id)).toBeNull();
+  });
+
+  it("ส่งต่ออีกทอดแล้วชี้ใบล่าสุด ไม่ใช่ใบที่ถูกแทน", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    await createHandoff(env.DB, t.id, "Claude", "ช่วยที", chatgpt);
+    const { handoff: second } = await createHandoff(env.DB, t.id, "Gemini", "ส่งต่อ", claude);
+
+    expect(await getCurrentHandoffId(env.DB, t.id)).toBe(second.id);
+  });
+
+  it("งานที่ปิดแล้วไม่มี handoff รออยู่ แม้ใบนั้นจะยัง pending", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    await createHandoff(env.DB, t.id, "Gemini", "ช่วยต่อ", chatgpt);
+    await updateTask(env.DB, t.id, chatgpt, { status: "done" });
+
+    expect(await getCurrentHandoffId(env.DB, t.id)).toBeNull();
+    const page = await readTasks(env.DB, WS, 10, {});
+    expect(page.rows[0]!.handoff).toBeNull();
+  });
+
+  it("กรอง get_tasks ตามสถานะและเจ้าของยังทำงานเหมือนเดิมหลังเพิ่มฟิลด์", async () => {
+    const mine = await createTask(env.DB, WS, "ของ Gemini", "", chatgpt, undefined, "Gemini");
+    await createTask(env.DB, WS, "ของคนอื่น", "", chatgpt, undefined, "Claude");
+    await updateTask(env.DB, mine.id, gemini, { status: "in_progress" });
+
+    const byOwner = await readTasks(env.DB, WS, 10, { assigned_to: "Gemini" });
+    expect(byOwner.rows.map((t) => t.id)).toEqual([mine.id]);
+
+    const byStatus = await readTasks(env.DB, WS, 10, { status: "in_progress" });
+    expect(byStatus.rows.map((t) => t.id)).toEqual([mine.id]);
+    expect(byStatus.total).toBe(1);
+  });
+});
+
+describe("plan", () => {
+  it("บันทึกแล้วอ่านกลับได้ พร้อมผู้เขียนจาก connection", async () => {
+    const p = await recordPlan(env.DB, WS, "ย้ายไป D1", "ขั้นตอนหนึ่งสองสาม", gemini);
+
+    expect(p.created_by).toBe("Gemini");
+    expect(p.created_by_client).toBe("c-gemini");
+    expect(p.supersedes).toBeNull();
+  });
+
+  it("ผูกกับกระทู้และข้อสรุปที่เป็นที่มาได้", async () => {
+    const dis = await createDiscussion(env.DB, WS, "ควรใช้อะไร", chatgpt);
+    const dec = await recordDecision(env.DB, WS, "ใช้ D1", "เหตุผล", chatgpt, dis.id);
+    const p = await recordPlan(env.DB, WS, "แผน", "ขั้นตอน", chatgpt, {
+      discussionId: dis.id,
+      decisionId: dec.id,
+    });
+
+    expect(p.discussion_id).toBe(dis.id);
+    expect(p.decision_id).toBe(dec.id);
+  });
+
+  it.each([
+    ["กระทู้", { discussionId: "ไม่มีจริง" }],
+    ["ข้อสรุป", { decisionId: "ไม่มีจริง" }],
+    ["แผนที่จะเขียนทับ", { supersedes: "ไม่มีจริง" }],
+  ])("ผูกกับ%sที่ไม่มีอยู่ไม่ได้", async (_label, links) => {
+    await expect(
+      recordPlan(env.DB, WS, "แผน", "ขั้นตอน", chatgpt, links),
+    ).rejects.toThrow(RequestError);
+  });
+
+  /**
+   * หัวใจของ Plan — แผนเก่าที่กองรวมกับแผนใหม่คือกับดักเดียวกับผลที่ถูกตัดแล้ว
+   * ดูเหมือนครบ ผู้อ่านไม่มีทางรู้ว่าอันไหนใช้อยู่
+   */
+  it("แผนที่ถูกเขียนทับหายไปจากผลลัพธ์", async () => {
+    const first = await recordPlan(env.DB, WS, "แผนแรก", "แบบเดิม", chatgpt);
+    const second = await recordPlan(env.DB, WS, "แผนใหม่", "แบบใหม่", gemini, {
+      supersedes: first.id,
+    });
+
+    const current = await readPlans(env.DB, WS, 10);
+    expect(current.rows.map((p) => p.id)).toEqual([second.id]);
+    expect(current.total).toBe(1);
+  });
+
+  it("ขอดูของเก่าด้วยก็ได้ และยังตามรอยได้ว่าอะไรแทนอะไร", async () => {
+    const first = await recordPlan(env.DB, WS, "แผนแรก", "แบบเดิม", chatgpt);
+    await recordPlan(env.DB, WS, "แผนใหม่", "แบบใหม่", gemini, { supersedes: first.id });
+
+    const all = await readPlans(env.DB, WS, 10, { includeSuperseded: true });
+    expect(all.total).toBe(2);
+    expect(all.rows.find((p) => p.supersedes === first.id)).toBeDefined();
+  });
+
+  it("เขียนทับต่อกันหลายชั้น เหลือตัวล่าสุดตัวเดียว", async () => {
+    const v1 = await recordPlan(env.DB, WS, "v1", "หนึ่ง", chatgpt);
+    const v2 = await recordPlan(env.DB, WS, "v2", "สอง", chatgpt, { supersedes: v1.id });
+    const v3 = await recordPlan(env.DB, WS, "v3", "สาม", chatgpt, { supersedes: v2.id });
+
+    const current = await readPlans(env.DB, WS, 10);
+    expect(current.rows.map((p) => p.id)).toEqual([v3.id]);
+  });
+
+  it("กรองเฉพาะแผนของกระทู้หนึ่งได้", async () => {
+    const dis = await createDiscussion(env.DB, WS, "กระทู้", chatgpt);
+    await recordPlan(env.DB, WS, "ของกระทู้", "x", chatgpt, { discussionId: dis.id });
+    await recordPlan(env.DB, WS, "ลอย ๆ", "y", chatgpt);
+
+    const page = await readPlans(env.DB, WS, 10, { discussionId: dis.id });
+    expect(page.rows.map((p) => p.title)).toEqual(["ของกระทู้"]);
+  });
+
+  it("บอก has_more เมื่อผลถูกตัด", async () => {
+    for (let i = 0; i < 4; i++) await recordPlan(env.DB, WS, `แผน ${i}`, "x", chatgpt);
+
+    const page = await readPlans(env.DB, WS, 2);
+    expect(page.rows).toHaveLength(2);
+    expect(page.has_more).toBe(true);
+    expect(page.total).toBe(4);
+  });
+});
+
+describe("ปิด decision", () => {
+  async function proposed() {
+    const dis = await createDiscussion(env.DB, WS, "ควรใช้อะไร", chatgpt);
+    const dec = await recordDecision(env.DB, WS, "ใช้ D1", "เหตุผล", chatgpt, dis.id);
+    return { dis, dec };
+  }
+
+  it("อนุมัติแล้วบันทึกผู้ปิดและเหตุผล", async () => {
+    const { dec } = await proposed();
+    const { decision } = await resolveDecision(
+      env.DB, dec.id, "approved", "ทีมเห็นพ้อง", claude,
+    );
+
+    expect(decision.status).toBe("approved");
+    expect(decision.decided_by).toBe("Claude");
+    expect(decision.decided_by_client).toBe("c-claude");
+    expect(decision.decided_reason).toBe("ทีมเห็นพ้อง");
+    expect(decision.decided_at).not.toBeNull();
+  });
+
+  it("ปฏิเสธของที่ซ้ำได้ — ปัญหาที่ Cursor ชนจริง", async () => {
+    const { dec } = await proposed();
+    const { decision } = await resolveDecision(
+      env.DB, dec.id, "rejected", "ซ้ำกับอีกอัน", claude,
+    );
+    expect(decision.status).toBe("rejected");
+
+    const stillOpen = await readDecisions(env.DB, WS, 10, "proposed");
+    expect(stillOpen.total).toBe(0);
+  });
+
+  /**
+   * ไม่มีรหัส = `relayed` ไม่ใช่ `human` ผู้เรียกยกระดับตัวเองไม่ได้ เพราะวัดมาแล้วว่า
+   * สิ่งที่ agent รายงานเกี่ยวกับการกระทำของตัวเองเชื่อไม่ได้
+   */
+  it("ไม่ส่งรหัสมา ได้ relayed", async () => {
+    const { dec } = await proposed();
+    const { decision } = await resolveDecision(env.DB, dec.id, "approved", "x", claude);
+    expect(decision.decided_by_kind).toBe("relayed");
+  });
+
+  it("ส่งรหัสถูก ได้ human", async () => {
+    const { dec } = await proposed();
+    const { decision } = await resolveDecision(
+      env.DB, dec.id, "approved", "x", claude, { code: "s3cret", secret: "s3cret" },
+    );
+    expect(decision.decided_by_kind).toBe("human");
+  });
+
+  /** พิมพ์รหัสผิดแล้วได้ผลที่อ่อนกว่าที่ตั้งใจโดยไม่มีใครบอก คือความล้มเหลวแบบเงียบ */
+  it("ส่งรหัสผิด ต้อง error ไม่ใช่ลดชั้นเงียบ ๆ", async () => {
+    const { dec } = await proposed();
+    await expect(
+      resolveDecision(env.DB, dec.id, "approved", "x", claude, {
+        code: "ผิด", secret: "s3cret",
+      }),
+    ).rejects.toThrow(RequestError);
+
+    const after = await readDecisions(env.DB, WS, 10, "proposed");
+    expect(after.total).toBe(1);
+  });
+
+  it("ส่งรหัสมาแต่เซิร์ฟเวอร์ไม่ได้ตั้งไว้ ต้อง error", async () => {
+    const { dec } = await proposed();
+    await expect(
+      resolveDecision(env.DB, dec.id, "approved", "x", claude, { code: "อะไรก็ได้" }),
+    ).rejects.toThrow(RequestError);
+  });
+
+  it("ปิดซ้ำไม่ได้ และบอกว่าใครปิดไปแล้ว", async () => {
+    const { dec } = await proposed();
+    await resolveDecision(env.DB, dec.id, "approved", "x", claude);
+
+    await expect(
+      resolveDecision(env.DB, dec.id, "rejected", "y", gemini),
+    ).rejects.toThrow(/Claude/);
+  });
+
+  it("ประกาศกลับเข้ากระทู้ให้ทุกคนเห็น", async () => {
+    const { dis, dec } = await proposed();
+    const before = await readMessages(env.DB, dis.id, 0, 50);
+
+    const { announced } = await resolveDecision(
+      env.DB, dec.id, "approved", "ทีมเห็นพ้อง", claude,
+    );
+
+    const after = await readMessages(env.DB, dis.id, 0, 50);
+    expect(announced).toBe(true);
+    expect(after.total).toBe(before.total + 1);
+    expect(after.messages.at(-1)!.body).toContain("ทีมเห็นพ้อง");
+    expect(after.messages.at(-1)!.author_name).toBe("Claude");
+  });
+
+  it("decision ที่ไม่ได้ผูกกระทู้ ก็ปิดได้ แค่ไม่มีที่ประกาศ", async () => {
+    const dec = await recordDecision(env.DB, WS, "ลอย ๆ", "เหตุผล", chatgpt);
+    const { announced, decision } = await resolveDecision(
+      env.DB, dec.id, "approved", "x", claude,
+    );
+    expect(announced).toBe(false);
+    expect(decision.status).toBe("approved");
+  });
+
+  it("ปิด decision ที่ไม่มีอยู่ ต้อง error", async () => {
+    await expect(
+      resolveDecision(env.DB, "ไม่มีจริง", "approved", "x", claude),
+    ).rejects.toThrow(RequestError);
+  });
+});
+
+describe("ชี้ทางว่าตัวที่ตกไปถูกแทนด้วยอันไหน", () => {
+  async function twoProposed() {
+    const dis = await createDiscussion(env.DB, WS, "ควรใช้อะไร", chatgpt);
+    const keep = await recordDecision(env.DB, WS, "ตัวจริง", "เหตุผล", chatgpt, dis.id);
+    const dup = await recordDecision(env.DB, WS, "ตัวซ้ำ", "เหตุผล", gemini, dis.id);
+    return { dis, keep, dup };
+  }
+
+  it("ปฏิเสธพร้อมชี้ไปหาตัวที่ใช้อยู่", async () => {
+    const { keep, dup } = await twoProposed();
+    const { decision } = await resolveDecision(
+      env.DB, dup.id, "rejected", "ซ้ำ", claude, {}, keep.id,
+    );
+    expect(decision.superseded_by).toBe(keep.id);
+  });
+
+  /**
+   * หัวใจของ field นี้ — Mistral ปฏิเสธสามอันแล้วให้ทั้งสามอ้างถึงกันเองวนไปวนมา
+   * คนอ่านตามไปแล้วหาตัวจริงไม่เจอ ถ้าห้ามชี้ไปหาตัวที่ตกไปแล้ว วงกลมเกิดไม่ได้เลย
+   */
+  it("ชี้ไปหาตัวที่ถูกปฏิเสธไปแล้วไม่ได้ — กันวงกลม", async () => {
+    const { keep, dup } = await twoProposed();
+    await resolveDecision(env.DB, dup.id, "rejected", "ซ้ำ", claude, {}, keep.id);
+
+    const third = await recordDecision(env.DB, WS, "อีกตัว", "เหตุผล", chatgpt);
+    await expect(
+      resolveDecision(env.DB, third.id, "rejected", "ซ้ำ", claude, {}, dup.id),
+    ).rejects.toThrow(/ถูกปฏิเสธไปแล้ว/);
+  });
+
+  it("ชี้กลับมาที่ตัวเองไม่ได้", async () => {
+    const { dup } = await twoProposed();
+    await expect(
+      resolveDecision(env.DB, dup.id, "rejected", "ซ้ำ", claude, {}, dup.id),
+    ).rejects.toThrow(RequestError);
+  });
+
+  it("ชี้ไปหา id ที่ไม่มีอยู่ไม่ได้", async () => {
+    const { dup } = await twoProposed();
+    await expect(
+      resolveDecision(env.DB, dup.id, "rejected", "ซ้ำ", claude, {}, "ไม่มีจริง"),
+    ).rejects.toThrow(RequestError);
+  });
+
+  it("ชี้ไปหาตัวที่ approved แล้วได้ เพราะยังใช้อยู่", async () => {
+    const { keep, dup } = await twoProposed();
+    await resolveDecision(env.DB, keep.id, "approved", "เอาอันนี้", claude);
+    const { decision } = await resolveDecision(
+      env.DB, dup.id, "rejected", "ซ้ำ", claude, {}, keep.id,
+    );
+    expect(decision.superseded_by).toBe(keep.id);
+  });
+
+  it("ไม่ระบุก็ได้ สำหรับการปฏิเสธที่ไม่มีอะไรมาแทน", async () => {
+    const { dup } = await twoProposed();
+    const { decision } = await resolveDecision(
+      env.DB, dup.id, "rejected", "ทีมไม่เอาแนวนี้แล้ว", claude,
+    );
+    expect(decision.superseded_by).toBeNull();
+  });
+
+  it("ประกาศในกระทู้บอกด้วยว่าให้ไปดูอันไหนแทน", async () => {
+    const { dis, keep, dup } = await twoProposed();
+    await resolveDecision(env.DB, dup.id, "rejected", "ซ้ำ", claude, {}, keep.id);
+
+    const page = await readMessages(env.DB, dis.id, 0, 50);
+    expect(page.messages.at(-1)!.body).toContain(keep.id);
+  });
+});
+
+describe("ภาพรวมของที่ยังค้าง", () => {
+  it("workspace ว่างเปล่าคืนศูนย์ ไม่ใช่พัง", async () => {
+    const items = await readOpenItems(env.DB, WS, "Claude");
+
+    expect(items.decisions_awaiting).toBe(0);
+    expect(items.plans_current).toBe(0);
+    expect(items.latest_plan).toBeNull();
+    expect(items.tasks).toEqual({});
+    expect(items.handoffs_pending).toBe(0);
+    expect(items.waiting_for_you.total).toBe(0);
+  });
+
+  it("นับ decision ที่ยังรอตัดสิน ไม่นับที่ปิดแล้ว", async () => {
+    const dis = await createDiscussion(env.DB, WS, "หัวข้อ", chatgpt);
+    await recordDecision(env.DB, WS, "ก", "x", chatgpt, dis.id);
+    const closed = await recordDecision(env.DB, WS, "ข", "x", chatgpt, dis.id);
+    await resolveDecision(env.DB, closed.id, "approved", "เอาอันนี้", claude);
+
+    const items = await readOpenItems(env.DB, WS, "Claude");
+    expect(items.decisions_awaiting).toBe(1);
+  });
+
+  it("นับ task แยกตามสถานะ และไม่นับที่ done แล้ว", async () => {
+    const a = await createTask(env.DB, WS, "ก", "", chatgpt);
+    const b = await createTask(env.DB, WS, "ข", "", chatgpt);
+    await createTask(env.DB, WS, "ค", "", chatgpt);
+    await updateTask(env.DB, a.id, claude, { status: "in_progress" });
+    await updateTask(env.DB, b.id, claude, { status: "done" });
+
+    const items = await readOpenItems(env.DB, WS, "Claude");
+    expect(items.tasks).toEqual({ open: 1, in_progress: 1 });
+  });
+
+  it("แผนที่ถูกเขียนทับแล้วไม่นับ", async () => {
+    const first = await recordPlan(env.DB, WS, "แผนแรก", "x", chatgpt);
+    await recordPlan(env.DB, WS, "แผนใหม่", "y", gemini, { supersedes: first.id });
+
+    const items = await readOpenItems(env.DB, WS, "Claude");
+    expect(items.plans_current).toBe(1);
+    expect(items.latest_plan?.title).toBe("แผนใหม่");
+  });
+
+  /**
+   * เหตุผลทั้งหมดที่เพิ่มส่วนนี้ — handoff ค้างห้าวันโดยไม่มีใครรับ เพราะไม่มีที่ไหน
+   * บอกว่ามีงานรออยู่ ปลายทางต้องเห็นตั้งแต่เรียก context ครั้งแรก
+   */
+  it("ยกงานที่ส่งถึงชื่อของผู้เรียกมาให้เห็น และนับงานเดียวครั้งเดียว", async () => {
+    const t = await createTask(env.DB, WS, "งานของ Gemini", "", chatgpt);
+    await createHandoff(env.DB, t.id, "Gemini", "ช่วยต่อให้ที", chatgpt);
+
+    const mine = await readOpenItems(env.DB, WS, "Gemini");
+    expect(mine.waiting_for_you.unaccepted.handoffs).toHaveLength(1);
+    expect(mine.waiting_for_you.unaccepted.handoffs[0]!.from).toBe("ChatGPT");
+    expect(mine.waiting_for_you.unaccepted.handoffs[0]!.state).toBe("waiting");
+    // handoff ตั้ง assigned_to ให้ด้วย ถ้ายกมาทั้งสองทางยอดจะเป็นสองทั้งที่มีงานใบเดียว
+    expect(mine.waiting_for_you.unaccepted.tasks).toEqual([]);
+    expect(mine.waiting_for_you.unaccepted.total).toBe(1);
+    expect(mine.waiting_for_you.total).toBe(1);
+  });
+
+  /**
+   * เส้นแบ่งทั้งหมดของข้อนี้ — "ยังไม่มีใครรับ" ต้องการให้รับ ส่วน "รับไปแล้ว"
+   * ต้องการให้ทำต่อ ถ้าอยู่กองเดียวกันผู้เรียกแยกไม่ออกว่าต้องลงมืออะไร
+   */
+  it("แยกงานที่ยังไม่มีใครรับ ออกจากงานที่รับไปแล้ว", async () => {
+    const mine = await createTask(env.DB, WS, "กำลังทำอยู่", "", chatgpt, undefined, "Gemini");
+    await updateTask(env.DB, mine.id, gemini, { status: "in_progress" });
+    const fresh = await createTask(env.DB, WS, "ยังไม่ได้เริ่ม", "", chatgpt, undefined, "Gemini");
+    const blocked = await createTask(env.DB, WS, "ติดอยู่", "", chatgpt, undefined, "Gemini");
+    await updateTask(env.DB, blocked.id, gemini, { status: "blocked" });
+
+    const items = await readOpenItems(env.DB, WS, "Gemini");
+
+    expect(items.waiting_for_you.in_progress.tasks.map((t) => t.id)).toEqual([mine.id]);
+    expect(items.waiting_for_you.unaccepted.tasks.map((t) => t.id)).toEqual([
+      fresh.id,
+      blocked.id,
+    ]);
+    expect(items.waiting_for_you.total).toBe(3);
+  });
+
+  /**
+   * GitHub ไม่แคร์ตัวพิมพ์ แต่ team_id ที่ทีมคัดมาจาก URL อาจมีตัวใหญ่ปน ขณะที่
+   * ผู้ส่งงานพิมพ์ตัวเล็ก ถ้าเทียบตรงตัวสองฝั่งจะไม่มีวันเจอกันโดยไม่มีใคร error
+   */
+  it("จับคู่ชื่อไม่สนตัวพิมพ์ใหญ่เล็ก", async () => {
+    const t = await createTask(env.DB, WS, "งานของทีม", "", chatgpt);
+    await createHandoff(env.DB, t.id, "monthop-gmail/agent-builder-pi-poc", "ช่วยต่อ", chatgpt);
+
+    const mixed = await readOpenItems(env.DB, WS, "Monthop-Gmail/Agent-Builder-PI-POC");
+    expect(mixed.waiting_for_you.unaccepted.handoffs).toHaveLength(1);
+    expect(mixed.waiting_for_you.unaccepted.total).toBe(1);
+  });
+
+  it("คนอื่นไม่เห็นงานที่ไม่ได้ส่งถึงตัวเอง", async () => {
+    const t = await createTask(env.DB, WS, "งานของ Gemini", "", chatgpt);
+    await createHandoff(env.DB, t.id, "Gemini", "ช่วยต่อ", chatgpt);
+
+    const other = await readOpenItems(env.DB, WS, "Claude");
+    expect(other.waiting_for_you.total).toBe(0);
+    // แต่ยังเห็นว่ามีของค้างในภาพรวม
+    expect(other.handoffs_pending).toBe(1);
+  });
+
+  it("handoff ที่ถูกรับไปแล้วไม่ค้างอยู่ในรายการอีก", async () => {
+    const t = await createTask(env.DB, WS, "งาน", "", chatgpt);
+    const { handoff } = await createHandoff(env.DB, t.id, "Gemini", "ช่วยต่อ", chatgpt);
+    await acceptHandoff(env.DB, handoff.id, gemini);
+
+    const items = await readOpenItems(env.DB, WS, "Gemini");
+    expect(items.handoffs_pending).toBe(0);
+    expect(items.waiting_for_you.unaccepted.handoffs).toEqual([]);
+    // แต่ task ยังเป็นของมันอยู่ ต้องยังเห็น — ย้ายไปกองที่รับแล้ว
+    expect(items.waiting_for_you.in_progress.tasks).toHaveLength(1);
+    expect(items.waiting_for_you.total).toBe(1);
+  });
+
+  it("นับเฉพาะของใน workspace ที่ถาม", async () => {
+    await env.DB.prepare(
+      "INSERT INTO workspaces (id, name, created_at) VALUES ('ws-002','อีกอัน','2026-01-01T00:00:00.000Z')",
+    ).run();
+    await createTask(env.DB, "ws-002", "งานที่อื่น", "", chatgpt, undefined, "Gemini");
+
+    const items = await readOpenItems(env.DB, WS, "Gemini");
+    expect(items.tasks).toEqual({});
+    expect(items.waiting_for_you.total).toBe(0);
+  });
+});

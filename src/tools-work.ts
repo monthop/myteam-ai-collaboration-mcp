@@ -1,0 +1,465 @@
+import { McpServer } from "@modelcontextprotocol/server";
+import { z } from "zod";
+import type { Env } from "./env";
+import { resolveAuthor, type StaticIdentity } from "./identity";
+import {
+  ACTIONABLE_HANDOFF_STATES,
+  DECISION_STATUSES,
+  STALE_AFTER_DAYS,
+  TASK_STATUSES,
+  acceptHandoff,
+  createHandoff,
+  createTask,
+  getCurrentHandoffId,
+  readDecisions,
+  readPlans,
+  recordPlan,
+  resolveDecision,
+  readHandoffs,
+  readTasks,
+  recordDecision,
+  updateTask,
+  type DecisionStatus,
+  type TaskStatus,
+} from "./db-work";
+import { Limit, Workspace, handoffReminder, registerTool, run } from "./tool-kit";
+
+const Detail = z.string().describe("Full reasoning or context. Be specific — this is what a participant who was not present will read.");
+
+/** tools ของ Phase 2 — สิ่งที่ตกผลึกจากการคุยแล้วต้องมีคนทำต่อ */
+export function registerWorkTools(server: McpServer, env: Env, staticIdentity?: StaticIdentity): void {
+  const author = () => resolveAuthor(staticIdentity, env.CLIENT_NAME_ALIASES);
+
+  registerTool(
+    server,
+    "record_decision",
+    {
+      description:
+        "Record a conclusion the group has reached, so it survives outside the " +
+        "thread. Recorded as 'proposed' — this tool cannot mark anything approved, " +
+        "because proposing is not deciding. A human approves separately.",
+      inputSchema: z.object({
+        title: z.string().min(1).describe("The decision in one line"),
+        detail: Detail,
+        workspace: Workspace,
+        discussion_id: z
+          .string()
+          .optional()
+          .describe("Discussion this came out of, if any"),
+      }),
+    },
+    async ({ title, detail, workspace, discussion_id }) =>
+      run(async () => {
+        const decision = await recordDecision(
+          env.DB,
+          workspace,
+          title,
+          detail,
+          author(),
+          discussion_id,
+        );
+        return {
+          decision_id: decision.id,
+          status: decision.status,
+          proposed_by: decision.proposed_by,
+          note: "สถานะเป็น 'proposed' — ยังไม่มีใครอนุมัติ",
+        };
+      }),
+  );
+
+  registerTool(
+    server,
+    "get_decisions",
+    {
+      description:
+        "List decisions in the workspace, newest first. Check this before " +
+        "reopening a settled question. 'proposed' means it is still awaiting a human.",
+      inputSchema: z.object({
+        workspace: Workspace,
+        status: z.enum(DECISION_STATUSES).optional().describe("Filter by status"),
+        limit: Limit,
+      }),
+    },
+    async ({ workspace, status, limit }) =>
+      run(async () => {
+        const page = await readDecisions(
+          env.DB,
+          workspace,
+          limit,
+          status as DecisionStatus | undefined,
+        );
+        return { decisions: page.rows, has_more: page.has_more, total: page.total };
+      }),
+  );
+
+  registerTool(
+    server,
+    "resolve_decision",
+    {
+      description:
+        "Close a decision as approved or rejected — use this to settle which " +
+        "proposal stands and to clear duplicates. A decision can only be closed " +
+        "once. Who closed it and how strongly that is evidenced are recorded by " +
+        "the server, not chosen by you.",
+      inputSchema: z.object({
+        decision_id: z.string().min(1),
+        verdict: z
+          .enum(["approved", "rejected"])
+          .describe("'approved' means this one stands; 'rejected' retires it"),
+        reason: z
+          .string()
+          .min(1)
+          .describe("Why. Someone reading this next month needs it to make sense."),
+        superseded_by: z
+          .string()
+          .optional()
+          .describe(
+            "When rejecting something as a duplicate, the id of the decision that " +
+              "stands in its place. Point at the one still in force — pointing at " +
+              "another rejected decision is refused, because a reader following the " +
+              "trail would never reach the real answer. Leave empty when rejecting " +
+              "on merit with nothing replacing it.",
+          ),
+        approval_code: z
+          .string()
+          .optional()
+          .describe(
+            "Only if a person handed you the server's approval code. Do not guess " +
+              "or reuse one — a wrong code fails the call instead of closing anything. " +
+              "Without it the closure is recorded as relayed, which is fine.",
+          ),
+      }),
+    },
+    async ({ decision_id, verdict, reason, superseded_by, approval_code }) =>
+      run(async () => {
+        const { decision, announced } = await resolveDecision(
+          env.DB,
+          decision_id,
+          verdict,
+          reason,
+          author(),
+          { code: approval_code, secret: env.APPROVAL_SECRET },
+          superseded_by,
+        );
+        return {
+          decision_id: decision.id,
+          status: decision.status,
+          decided_by: decision.decided_by,
+          decided_by_kind: decision.decided_by_kind,
+          superseded_by: decision.superseded_by,
+          announced_in_discussion: announced,
+          note:
+            decision.decided_by_kind === "human"
+              ? "ยืนยันด้วยรหัสแล้ว บันทึกเป็นการตัดสินใจของคน"
+              : "บันทึกเป็น relayed — เชื่อว่ามีคนสั่ง แต่ยังไม่มีอะไรยืนยัน",
+        };
+      }),
+  );
+
+  registerTool(
+    server,
+    "record_plan",
+    {
+      description:
+        "Write down how the group intends to carry something out, so it can be " +
+        "found without reading the whole thread. Plans cannot be edited — if the " +
+        "approach changes, record a new one and set 'supersedes' to the old id.",
+      inputSchema: z.object({
+        title: z.string().min(1).describe("The plan in one line"),
+        body: z
+          .string()
+          .min(1)
+          .describe("The steps, in enough detail that someone else can act on them"),
+        workspace: Workspace,
+        discussion_id: z.string().optional().describe("Discussion this came out of"),
+        decision_id: z.string().optional().describe("Decision this carries out"),
+        supersedes: z
+          .string()
+          .optional()
+          .describe("Id of the plan this replaces. The old one stops showing in get_plans."),
+      }),
+    },
+    async ({ title, body, workspace, discussion_id, decision_id, supersedes }) =>
+      run(async () => {
+        const plan = await recordPlan(env.DB, workspace, title, body, author(), {
+          discussionId: discussion_id,
+          decisionId: decision_id,
+          supersedes,
+        });
+        return {
+          plan_id: plan.id,
+          created_by: plan.created_by,
+          supersedes: plan.supersedes,
+          note: "แผนแก้ไม่ได้ ถ้าเปลี่ยนให้บันทึกใหม่แล้วระบุ supersedes",
+        };
+      }),
+  );
+
+  registerTool(
+    server,
+    "get_plans",
+    {
+      description:
+        "List the plans in force, newest first. Superseded plans are hidden " +
+        "unless you ask for them. Read this before planning something yourself — " +
+        "someone may already have.",
+      inputSchema: z.object({
+        workspace: Workspace,
+        discussion_id: z.string().optional().describe("Only plans from this discussion"),
+        include_superseded: z
+          .boolean()
+          .default(false)
+          .describe("Include plans that have been replaced"),
+        limit: Limit,
+      }),
+    },
+    async ({ workspace, discussion_id, include_superseded, limit }) =>
+      run(async () => {
+        const page = await readPlans(env.DB, workspace, limit, {
+          discussionId: discussion_id,
+          includeSuperseded: include_superseded,
+        });
+        return { plans: page.rows, has_more: page.has_more, total: page.total };
+      }),
+  );
+
+  registerTool(
+    server,
+    "create_task",
+    {
+      description:
+        "Turn something the group agreed on into work with an owner. Starts as " +
+        "'open'. Link it to the discussion it came from so whoever picks it up " +
+        "can read the reasoning.",
+      inputSchema: z.object({
+        title: z.string().min(1).describe("What needs doing, in one line"),
+        detail: Detail.default(""),
+        workspace: Workspace,
+        discussion_id: z.string().optional().describe("Discussion this came out of"),
+        assigned_to: z
+          .string()
+          .optional()
+          .describe(
+            "Who should do it, if that is already settled. This records ownership " +
+              "only — it is NOT a handoff and sends them no context. To hand work " +
+              "over, create the task and then call create_handoff.",
+          ),
+      }),
+    },
+    async ({ title, detail, workspace, discussion_id, assigned_to }) =>
+      run(async () => {
+        const task = await createTask(
+          env.DB,
+          workspace,
+          title,
+          detail,
+          author(),
+          discussion_id,
+          assigned_to,
+        );
+        return {
+          task_id: task.id,
+          status: task.status,
+          assigned_to: task.assigned_to,
+          created_by: task.created_by,
+          // ระบุออกมาตรง ๆ ว่ายังไม่มี handoff เพื่อไม่ให้ผู้เรียกเล่าว่าส่งต่อแล้ว
+          handoff: null,
+          ...(handoffReminder(task.assigned_to)
+            ? { note: handoffReminder(task.assigned_to) }
+            : {}),
+        };
+      }),
+  );
+
+  registerTool(
+    server,
+    "update_task",
+    {
+      description:
+        "Change a task's status, owner, or detail. Pass at least one of them. " +
+        "Your name is recorded as the one who made the change.",
+      inputSchema: z.object({
+        task_id: z.string().min(1),
+        status: z.enum(TASK_STATUSES).optional(),
+        assigned_to: z
+          .string()
+          .nullable()
+          .optional()
+          .describe(
+            "Change the owner. Records ownership only — not a handoff. Pass null " +
+              "to leave the task with no owner.",
+          ),
+        detail: z.string().optional(),
+      }),
+    },
+    async ({ task_id, status, assigned_to, detail }) =>
+      run(async () => {
+        const task = await updateTask(env.DB, task_id, author(), {
+          status: status as TaskStatus | undefined,
+          assigned_to,
+          detail,
+        });
+        return {
+          task_id: task.id,
+          status: task.status,
+          assigned_to: task.assigned_to,
+          updated_by: task.updated_by,
+          updated_at: task.updated_at,
+          // เช่นเดียวกับ create_task — บอกตรง ๆ ว่ามี handoff รออยู่หรือไม่ ไม่ใช่เงียบ
+          handoff: await getCurrentHandoffId(env.DB, task.id),
+          // เตือนเฉพาะตอนที่ผู้เรียกเปลี่ยนผู้รับผิดชอบเองในคำสั่งนี้
+          ...(assigned_to != null && handoffReminder(assigned_to)
+            ? { note: handoffReminder(assigned_to) }
+            : {}),
+        };
+      }),
+  );
+
+  registerTool(
+    server,
+    "get_tasks",
+    {
+      description:
+        "List tasks in the workspace, newest first. Filter by status or owner to " +
+        "find what is still open or what is yours. Each row carries 'handoff': the " +
+        "id of the handoff still waiting to be accepted, or null when nobody has " +
+        "been handed this work — an owner alone does not mean it was handed over.",
+      inputSchema: z.object({
+        workspace: Workspace,
+        status: z.enum(TASK_STATUSES).optional(),
+        assigned_to: z.string().optional().describe("Filter to one owner"),
+        limit: Limit,
+      }),
+    },
+    async ({ workspace, status, assigned_to, limit }) =>
+      run(async () => {
+        const page = await readTasks(env.DB, workspace, limit, {
+          status: status as TaskStatus | undefined,
+          assigned_to,
+        });
+        return { tasks: page.rows, has_more: page.has_more, total: page.total };
+      }),
+  );
+
+  registerTool(
+    server,
+    "create_handoff",
+    {
+      description:
+        "Hand a task to someone else along with what you did, what is left, and " +
+        "where you got stuck. This also reassigns the task. Use it instead of " +
+        "silently reassigning — the context is the part that matters.",
+      inputSchema: z.object({
+        task_id: z.string().min(1),
+        to: z
+          .string()
+          .min(1)
+          .describe("Who should pick this up. Free text — they need not be connected yet."),
+        context: z
+          .string()
+          .min(1)
+          .describe(
+            // สองกรณีเพราะ handoff มีสองแบบจริง — ส่งต่องานที่ทำค้างไว้ กับมอบงานใหม่
+            // พร้อมโจทย์ ถ้อยคำเดิมครอบแต่แบบแรก ทำให้ handoff ที่ดีที่สุดที่ระบบเคยมี
+            // (ho-932138dd) สอบตกทั้งที่ผู้รับเองยกว่าเป็นตัวอย่างที่ดี — ข้อสังเกตจาก
+            // monthop-gmail/agent-platform ใน dis-96c2a3fa seq 7 ซึ่งเป็นผู้รับใบนั้น
+            "For work already under way: what you did, what remains, and anything " +
+              "that blocked you. For work that starts here: where the context lives, " +
+              "what angle you want, what is out of scope this round, and where the " +
+              "result should go.",
+          ),
+      }),
+    },
+    async ({ task_id, to, context }) =>
+      run(async () => {
+        const { handoff, task } = await createHandoff(
+          env.DB,
+          task_id,
+          to,
+          context,
+          author(),
+        );
+        return {
+          handoff_id: handoff.id,
+          task_id: task.id,
+          to: handoff.to_whom,
+          from: handoff.from_name,
+          task_assigned_to: task.assigned_to,
+          status: handoff.status,
+        };
+      }),
+  );
+
+  registerTool(
+    server,
+    "get_handoffs",
+    {
+      description:
+        "List handoffs in the workspace, newest first. Call this when you join to " +
+        "see whether work is waiting for you. Defaults to pending ones only. Each " +
+        "row carries a 'state': 'waiting' still needs someone to accept it, " +
+        "'stale' has been waiting over " +
+        `${STALE_AFTER_DAYS} days and needs a decision rather than more waiting, ` +
+        "'superseded' was replaced by a newer handoff on the same task, and " +
+        "'obsolete' points at a task that is already done — the last two need no " +
+        "one to accept them.",
+      inputSchema: z.object({
+        workspace: Workspace,
+        status: z
+          .enum(["pending", "accepted"])
+          .default("pending")
+          .describe("Which handoffs to show"),
+        to: z.string().optional().describe("Filter to handoffs aimed at this name"),
+        task_id: z.string().optional().describe("Filter to one task"),
+        limit: Limit,
+      }),
+    },
+    async ({ workspace, status, to, task_id, limit }) =>
+      run(async () => {
+        const page = await readHandoffs(env.DB, workspace, limit, {
+          status,
+          to_whom: to,
+          task_id,
+        });
+        const inactive = page.rows.filter(
+          (h) => !ACTIONABLE_HANDOFF_STATES.includes(h.state) && h.status === "pending",
+        );
+        return {
+          handoffs: page.rows,
+          has_more: page.has_more,
+          total: page.total,
+          ...(inactive.length > 0
+            ? {
+                note:
+                  `${inactive.length} of these are still 'pending' but no longer need ` +
+                  "accepting (superseded or obsolete). Close the loop by finishing or " +
+                  "reassigning the task they point at, not by accepting them.",
+              }
+            : {}),
+        };
+      }),
+  );
+
+  registerTool(
+    server,
+    "accept_handoff",
+    {
+      description:
+        "Take on a handed-over task. Records you as the one who accepted it and " +
+        "moves the task to 'in_progress'. You are identified by your connection, " +
+        "so you cannot accept on someone else's behalf.",
+      inputSchema: z.object({ handoff_id: z.string().min(1) }),
+    },
+    async ({ handoff_id }) =>
+      run(async () => {
+        const { handoff, task } = await acceptHandoff(env.DB, handoff_id, author());
+        return {
+          handoff_id: handoff.id,
+          accepted_by: handoff.accepted_by,
+          task_id: task.id,
+          task_status: task.status,
+          task_assigned_to: task.assigned_to,
+        };
+      }),
+  );
+}
